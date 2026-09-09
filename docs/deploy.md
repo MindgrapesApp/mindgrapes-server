@@ -197,7 +197,7 @@ Deploy:
 
 ```sh
 # On the host, fresh checkout:
-git clone https://github.com/JoeCotellese/mindgrapes-server
+git clone https://github.com/MindgrapesApp/mindgrapes-server
 cd mindgrapes-server
 
 # Securely transfer the prod .env from your workstation. NEVER email/Slack:

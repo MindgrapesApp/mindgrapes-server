@@ -34,7 +34,7 @@ Prerequisites: Docker, [uv](https://docs.astral.sh/uv/), Python 3.12, and
 trufflehog`) for the secret-scan hook.
 
 ```sh
-git clone https://github.com/JoeCotellese/mindgrapes-server
+git clone https://github.com/MindgrapesApp/mindgrapes-server
 cd mindgrapes-server
 cd web && uv sync && cd ..            # Python deps (for running tests locally)
 uv run --project web pre-commit install   # secret-scan hook (needs trufflehog on PATH)
