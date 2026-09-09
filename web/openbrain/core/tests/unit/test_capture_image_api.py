@@ -343,10 +343,12 @@ def test_large_but_permitted_photo_is_accepted(client, service, settings):
 # Idempotency key (#59) ----------------------------------------------------
 
 
-def test_idempotency_key_is_forwarded_when_present(client, service):
+def test_idempotency_key_is_forwarded_namespaced_to_the_image_door(client, service):
+    # The stored key carries the door so an image key can never resolve to a note
+    # response (whose shape lacks attachment_id). Reverted, this reads "abc-123".
     resp = _post(client, {"image": _upload(), "idempotency_key": "abc-123"})
     assert resp.status_code == 200, resp.content
-    assert service["idempotency_key"] == "abc-123"
+    assert service["idempotency_key"] == "image:abc-123"
 
 
 def test_absent_idempotency_key_forwards_none(client, service):
@@ -359,3 +361,18 @@ def test_empty_idempotency_key_is_400_and_never_calls_service(client, service):
     resp = _post(client, {"image": _upload(), "idempotency_key": "   "})
     assert resp.status_code == 400
     assert service == {}
+
+
+def test_overlong_idempotency_key_is_400_and_never_calls_service(client, service):
+    # A key past the btree index-row limit would fail the Phase 2 claim insert
+    # AFTER the experience was written — a 500. Reject it at the door instead.
+    resp = _post(client, {"image": _upload(), "idempotency_key": "k" * 256})
+    assert resp.status_code == 400
+    assert service == {}
+
+
+def test_a_key_at_the_length_limit_is_accepted(client, service):
+    key = "k" * 255
+    resp = _post(client, {"image": _upload(), "idempotency_key": key})
+    assert resp.status_code == 200, resp.content
+    assert service["idempotency_key"] == f"image:{key}"
