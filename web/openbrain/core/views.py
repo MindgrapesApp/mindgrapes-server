@@ -232,6 +232,44 @@ def _occurred_at(raw: str) -> str | None:
     return text
 
 
+_MAX_IDEMPOTENCY_KEY_LEN = 255
+
+
+def _idempotency_key(raw, door: str) -> str | None:
+    """The client's dedup key (#59), namespaced by door: absent -> None.
+
+    Shared by both doors. Absent (None / missing field) preserves today's no-dedup
+    behavior; a present-but-empty value is a 400, not a silent fallthrough, so a
+    client that meant to dedup and sent junk learns it did not.
+
+    Two things the raw value does not get to decide, because it is untrusted
+    client input:
+
+    Length. The stored key is half of brain.capture_idempotency's composite btree
+    primary key, and a btree index row tops out at 2704 bytes. An overlong key
+    passes Phase 1's comparison (a `=` never touches the index limit) and then
+    fails the Phase 2 claim insert — AFTER the experience is written — with a
+    psycopg error no view catches, i.e. a 500 on input we can answer 400 here.
+
+    Scope. The doors store different response shapes (note returns one key, image
+    four), so one key reused across both would replay the wrong shape: a note
+    response handed to the image door KeyErrors on attachment_id, and an image
+    response handed to the note door returns the image's experience_id as a
+    silently wrong 200. Prefixing with the door gives each its own key space,
+    which is invisible to the client — it still sends the key it minted.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError("idempotency_key must be a non-empty string")
+    key = raw.strip()
+    if len(key) > _MAX_IDEMPOTENCY_KEY_LEN:
+        raise ValueError(
+            f"idempotency_key must be at most {_MAX_IDEMPOTENCY_KEY_LEN} characters"
+        )
+    return f"{door}:{key}"
+
+
 def _location(post) -> dict | None:
     """{lat, lng} from the form, or None. EXIF fills the gap when absent."""
     lat_raw = (post.get("lat") or "").strip()
@@ -270,6 +308,7 @@ def _image_fields(post) -> dict:
         "location": _location(post),
         "participants": _participants(post.get("people") or ""),
         "metadata": {"labels": labels} if labels else None,
+        "idempotency_key": _idempotency_key(post.get("idempotency_key"), "image"),
     }
 
 
@@ -378,6 +417,7 @@ def _note_fields(payload: dict) -> dict:
         "lat": loc["lat"] if loc else None,
         "lng": loc["lng"] if loc else None,
         "metadata_extra": {"labels": labels} if labels else None,
+        "idempotency_key": _idempotency_key(payload.get("idempotency_key"), "note"),
     }
 
 

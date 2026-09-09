@@ -139,3 +139,50 @@ def test_unauthorized_post_writes_nothing(client):
     resp = _post(client, {"content": "should not land"}, {})
     assert resp.status_code == 401
     assert _experience_count() == before
+
+
+@override_settings(BRAIN_EMBED_FN=EMBED)
+def test_same_idempotency_key_replays_one_experience(client):
+    # The lost-ACK retry: same (owner, key) twice returns the same experience and
+    # writes exactly one row. Reverted, the second POST would create a second row
+    # with a new id and both assertions fail.
+    before = _experience_count()
+    body = {"content": "idempotent note alpha", "idempotency_key": "itest-idem-note-a"}
+    r1 = _post(client, body)
+    r2 = _post(client, body)
+    assert r1.status_code == 200 and r2.status_code == 200
+    assert r1.json()["experience_id"] == r2.json()["experience_id"]
+    assert _experience_count() == before + 1
+
+
+@override_settings(BRAIN_EMBED_FN=EMBED)
+def test_absent_idempotency_key_creates_two_experiences(client):
+    # Missing key preserves today's behavior. This passes with the fix reverted too;
+    # it guards the no-dedup passthrough, not the dedup itself.
+    before = _experience_count()
+    body = {"content": "no-key note"}
+    r1 = _post(client, body)
+    r2 = _post(client, body)
+    assert r1.json()["experience_id"] != r2.json()["experience_id"]
+    assert _experience_count() == before + 2
+
+
+@override_settings(BRAIN_EMBED_FN=EMBED)
+def test_same_key_different_owners_do_not_collide(client):
+    # Keys are untrusted client input scoped by (owner, key): owner B must not
+    # replay owner A's experience. Guards the scope, not the dedup's existence.
+    before = _experience_count()
+    body = {"content": "shared-key note", "idempotency_key": "itest-idem-shared"}
+    r1 = _post(client, body, _bearer(sub="itest-owner-A"))
+    r2 = _post(client, body, _bearer(sub="itest-owner-B"))
+    assert r1.json()["experience_id"] != r2.json()["experience_id"]
+    assert _experience_count() == before + 2
+
+
+@override_settings(BRAIN_EMBED_FN=EMBED)
+def test_empty_idempotency_key_is_rejected(client):
+    # Present-but-empty is a client error, not a silent no-dedup fallthrough.
+    before = _experience_count()
+    resp = _post(client, {"content": "bad key", "idempotency_key": "  "})
+    assert resp.status_code == 400
+    assert _experience_count() == before

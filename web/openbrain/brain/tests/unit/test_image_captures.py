@@ -41,7 +41,15 @@ def wired(monkeypatch):
 
     def fake_capture(**kwargs):
         captured.update(kwargs)
-        return {"experience_id": "exp-1", "is_structured": True, "metadata": {}}
+        # Faithful to the real capture(): it merges response_extra into its return
+        # (captures.py), which is where the image door's attachment_id / object_key
+        # / byte_len now come from — capture_image no longer re-stamps them.
+        return {
+            "experience_id": "exp-1",
+            "is_structured": True,
+            "metadata": {},
+            **(kwargs.get("response_extra") or {}),
+        }
 
     monkeypatch.setattr(f"{_MOD}.embed_query", lambda text: [0.01] * 1536)
     monkeypatch.setattr(f"{_MOD}.captures.capture", fake_capture)

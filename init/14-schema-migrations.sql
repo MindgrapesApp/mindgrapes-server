@@ -47,5 +47,6 @@ insert into brain.schema_migrations (id, name, applied_by) values
   ('20', 'animal-entity-kind', 'bootstrap'),
   ('21', 'resolve-entity-exact-first', 'bootstrap'),
   ('22', 'traversal-merged-anchor', 'bootstrap'),
-  ('23', 'flatten-merge-chains', 'bootstrap')
+  ('23', 'flatten-merge-chains', 'bootstrap'),
+  ('24', 'capture-idempotency', 'bootstrap')
 on conflict (id) do nothing;

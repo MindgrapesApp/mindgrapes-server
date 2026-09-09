@@ -76,7 +76,9 @@ def _bearer(sub="app-user"):
 
 def _post(client, data=None, headers=None):
     payload = {"image": _upload()} if data is None else data
-    return client.post(URL, data=payload, **(headers if headers is not None else _bearer()))
+    return client.post(
+        URL, data=payload, **(headers if headers is not None else _bearer())
+    )
 
 
 # Auth + method ------------------------------------------------------------
@@ -114,7 +116,9 @@ def test_options_preflight_answers_with_cors(client):
 # Size ceiling -------------------------------------------------------------
 
 
-def test_oversize_upload_is_413_and_never_decodes(client, service, settings, monkeypatch):
+def test_oversize_upload_is_413_and_never_decodes(
+    client, service, settings, monkeypatch
+):
     settings.MAX_IMAGE_UPLOAD_BYTES = 100
 
     def boom(*a, **k):
@@ -142,7 +146,9 @@ def test_missing_image_part_is_400(client, service):
     assert service == {}
 
 
-def test_non_image_bytes_are_415_even_with_an_image_content_type(client, service, monkeypatch):
+def test_non_image_bytes_are_415_even_with_an_image_content_type(
+    client, service, monkeypatch
+):
     # The client's declared Content-Type is not trusted; validation is by decode.
     def boom(**kwargs):
         raise ImageDecodeError("not a decodable image")
@@ -234,7 +240,10 @@ def test_people_object_with_a_blank_name_is_400(client, service):
 def test_people_object_keeps_its_other_keys(client, service):
     _post(
         client,
-        {"image": _upload(), "people": '[{"name": " Sofia ", "relationship": "daughter"}]'},
+        {
+            "image": _upload(),
+            "people": '[{"name": " Sofia ", "relationship": "daughter"}]',
+        },
     )
     assert service["participants"] == [{"name": "Sofia", "relationship": "daughter"}]
 
@@ -311,8 +320,10 @@ def test_bytes_are_read_from_the_upload_not_the_declared_type(client, service):
 def test_heic_named_upload_still_reaches_the_service_as_bytes(client, service):
     # iOS sends .heic; the view must not filter on filename/extension.
     raw = _png()
-    _post(client, {"image": _upload(name="IMG_0042.HEIC", data=raw,
-                                    content_type="image/heic")})
+    _post(
+        client,
+        {"image": _upload(name="IMG_0042.HEIC", data=raw, content_type="image/heic")},
+    )
     assert service["image_bytes"] == raw
 
 
@@ -327,3 +338,41 @@ def test_large_but_permitted_photo_is_accepted(client, service, settings):
     resp = _post(client, {"image": _upload(data=raw)})
     assert resp.status_code == 200
     assert service["image_bytes"] == raw
+
+
+# Idempotency key (#59) ----------------------------------------------------
+
+
+def test_idempotency_key_is_forwarded_namespaced_to_the_image_door(client, service):
+    # The stored key carries the door so an image key can never resolve to a note
+    # response (whose shape lacks attachment_id). Reverted, this reads "abc-123".
+    resp = _post(client, {"image": _upload(), "idempotency_key": "abc-123"})
+    assert resp.status_code == 200, resp.content
+    assert service["idempotency_key"] == "image:abc-123"
+
+
+def test_absent_idempotency_key_forwards_none(client, service):
+    resp = _post(client, {"image": _upload()})
+    assert resp.status_code == 200
+    assert service["idempotency_key"] is None
+
+
+def test_empty_idempotency_key_is_400_and_never_calls_service(client, service):
+    resp = _post(client, {"image": _upload(), "idempotency_key": "   "})
+    assert resp.status_code == 400
+    assert service == {}
+
+
+def test_overlong_idempotency_key_is_400_and_never_calls_service(client, service):
+    # A key past the btree index-row limit would fail the Phase 2 claim insert
+    # AFTER the experience was written — a 500. Reject it at the door instead.
+    resp = _post(client, {"image": _upload(), "idempotency_key": "k" * 256})
+    assert resp.status_code == 400
+    assert service == {}
+
+
+def test_a_key_at_the_length_limit_is_accepted(client, service):
+    key = "k" * 255
+    resp = _post(client, {"image": _upload(), "idempotency_key": key})
+    assert resp.status_code == 200, resp.content
+    assert service["idempotency_key"] == f"image:{key}"

@@ -25,7 +25,12 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime
 
-from openbrain.brain.db import brain_cursor, dictfetchall, to_vector_literal
+from openbrain.brain.db import (
+    brain_cursor,
+    dictfetchall,
+    lookup_idempotent,
+    to_vector_literal,
+)
 from openbrain.brain.embeddings import embed_query
 from openbrain.brain.extraction.geo import promote_latlng
 from openbrain.brain.extraction.images import process_image
@@ -112,8 +117,18 @@ def _blob_from_raw(account_id: str, raw: bytes) -> _Blob:
     )
 
 
-def _prepare_blob(*, store, account_id, image_base64, image_bytes, object_key,
-                  original_sha256, mime, width, height) -> _Blob:
+def _prepare_blob(
+    *,
+    store,
+    account_id,
+    image_base64,
+    image_bytes,
+    object_key,
+    original_sha256,
+    mime,
+    width,
+    height,
+) -> _Blob:
     """Resolve the intake to a _Blob. Three doors, one engine.
 
     Exactly one intake must be supplied: inline base64 (small MCP screenshots),
@@ -172,7 +187,9 @@ def _metadata_depth(value, depth=0) -> int:
     if depth > MAX_METADATA_DEPTH:
         return depth
     if isinstance(value, dict):
-        return max((_metadata_depth(v, depth + 1) for v in value.values()), default=depth)
+        return max(
+            (_metadata_depth(v, depth + 1) for v in value.values()), default=depth
+        )
     if isinstance(value, list):
         return max((_metadata_depth(v, depth + 1) for v in value), default=depth)
     return depth
@@ -234,8 +251,17 @@ def _placeholder(occurred_at, place_label) -> str:
     return f"[image captured {when}{where}, description pending]"
 
 
-def _resolve_description(*, description, ocr, visibility, derivative, mime,
-                         occurred_at, place_label, row_metadata) -> tuple[str, bool]:
+def _resolve_description(
+    *,
+    description,
+    ocr,
+    visibility,
+    derivative,
+    mime,
+    occurred_at,
+    place_label,
+    row_metadata,
+) -> tuple[str, bool]:
     """Caller description is primary; vision is the visibility-gated fallback."""
     if description and description.strip():
         return _compose_content(description, ocr, "")
@@ -275,6 +301,7 @@ def capture_image(
     ocr: str | None = None,
     event: str | None = None,
     client: str = "mcp",
+    idempotency_key: str | None = None,
 ) -> dict:
     """Capture an image as a searchable experience backed by a stored blob.
 
@@ -284,6 +311,16 @@ def capture_image(
     the app already PUT the derivative via a presigned URL and passes
     object_key+original_sha256+mime+width+height. Exactly one must be supplied.
     """
+    # Phase 1: a lost-ACK replay returns the stored four-field response and does no
+    # vision, embed, or S3 put (#59). Placed before _prepare_blob and all network
+    # I/O — "dedupe before the put". The inner captures.capture() runs its own
+    # early lookup too, closing the residual race window at negligible cost.
+    if idempotency_key:
+        with brain_cursor() as cursor:
+            existing = lookup_idempotent(cursor, owner, idempotency_key)
+        if existing is not None:
+            return existing
+
     _validate_metadata(metadata)
     store = blobstore_mod.get_blobstore()
     location = location or {}
@@ -293,7 +330,8 @@ def capture_image(
         row_metadata["ocr"] = ocr
     if place_label or location.get("accuracy_m") or location.get("source"):
         row_metadata["location"] = {
-            k: location.get(k) for k in ("label", "accuracy_m", "source")
+            k: location.get(k)
+            for k in ("label", "accuracy_m", "source")
             if location.get(k) is not None
         }
 
@@ -337,16 +375,23 @@ def capture_image(
     def _after_insert(cursor, experience_id):
         cursor.execute(
             _UPSERT_BLOB_SQL,
-            [store.bucket, blob.key, blob.mime, blob.byte_len,
-             blob.derivative_sha, blob.orig_sha],
+            [
+                store.bucket,
+                blob.key,
+                blob.mime,
+                blob.byte_len,
+                blob.derivative_sha,
+                blob.orig_sha,
+            ],
         )
         blob_id = dictfetchall(cursor)[0]["id"]
         cursor.execute(
             _INSERT_ATTACHMENT_SQL,
             [attachment_id, experience_id, blob_id, blob.width, blob.height],
         )
-        _link_place_event(cursor, experience_id, to_vector_literal(embedding),
-                          place_label, event)
+        _link_place_event(
+            cursor, experience_id, to_vector_literal(embedding), place_label, event
+        )
 
     result = captures.capture(
         content=content,
@@ -363,10 +408,18 @@ def capture_image(
         metadata_extra=row_metadata,
         embedding=embedding,
         after_insert=_after_insert,
+        idempotency_key=idempotency_key,
+        response_extra={
+            "attachment_id": attachment_id,
+            "object_key": blob.key,
+            "byte_len": blob.byte_len,
+        },
     )
-    result["attachment_id"] = attachment_id
-    result["object_key"] = blob.key
-    result["byte_len"] = blob.byte_len
+    # The four-field shape is carried by response_extra above, which capture()
+    # merges into both the returned dict and the stored response. Do NOT re-stamp
+    # it here: on an idempotent replay (Phase 1 hit, or a Phase 2 race the loser),
+    # result is the WINNER's stored response, and overwriting it with this call's
+    # rolled-back attachment_id would hand the client an id that references no row.
     return result
 
 
@@ -381,11 +434,16 @@ def _link_place_event(cursor, experience_id, embedding_lit, place_label, event) 
         if not surface or not str(surface).strip():
             continue
         outcome = resolve_or_create_entity(
-            cursor, experience_id, embedding_lit,
-            surface=str(surface).strip(), field="topics", kind=kind,
+            cursor,
+            experience_id,
+            embedding_lit,
+            surface=str(surface).strip(),
+            field="topics",
+            kind=kind,
         )
-        link_mention(cursor, experience_id, outcome["entity_id"], str(surface).strip(),
-                     "topics")
+        link_mention(
+            cursor, experience_id, outcome["entity_id"], str(surface).strip(), "topics"
+        )
 
 
 def orphan_blob_keys(bucket: str | None = None) -> list[str]:

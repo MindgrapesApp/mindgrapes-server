@@ -8,7 +8,9 @@ from django.utils.module_loading import import_string
 
 from openbrain.brain.db import (
     brain_cursor,
+    claim_idempotent,
     dictfetchall,
+    lookup_idempotent,
     to_vector_literal,
     write_experience,
 )
@@ -26,6 +28,15 @@ from openbrain.brain.services.reviews import open_provisional_binding_on_cursor
 # lat/lng (#43) are nullable geolocation columns: null when the caller gave neither
 # params nor usable EXIF, and never an error.
 _DEFAULT_SOURCE_KIND = "manual"
+
+
+class _IdempotentReplay(Exception):
+    """Raised inside the capture txn when a concurrent racer already holds the key.
+
+    Rolls the just-inserted experience back so the winner's row is the only one;
+    the caller catches it and returns the winner's stored response (#59).
+    """
+
 
 _FETCH_ENTITY_SQL = """
     select id::text as entity_id, kind::text as kind
@@ -68,6 +79,8 @@ def capture(
     metadata_extra: dict | None = None,
     embedding: list[float] | None = None,
     after_insert=None,
+    idempotency_key: str | None = None,
+    response_extra: dict | None = None,
 ) -> dict:
     """Write one experience and return the capture_thought structuredContent dict.
 
@@ -88,6 +101,13 @@ def capture(
     right after the experience (and participant) inserts, so an attachment row
     commits atomically with its experience. Both are internal seams for
     capture_image, not part of the MCP surface.
+
+    `idempotency_key` (scoped to `owner`) makes the write replay-safe (#59): a
+    repeat of the same (owner, key) returns the first call's stored response
+    instead of inserting a second experience. `response_extra` merges extra keys
+    (the image door's attachment_id / object_key / byte_len) into both the returned
+    and the stored response so a replay reproduces the caller's full shape. Absent
+    key → no dedup, today's behavior exactly.
     """
     if is_structured_capture(
         occurred_at, participants, predicate_hints, source_kind, source_ref
@@ -108,6 +128,8 @@ def capture(
             metadata_extra=metadata_extra,
             embedding=embedding,
             after_insert=after_insert,
+            idempotency_key=idempotency_key,
+            response_extra=response_extra,
         )
     return _bare_capture(
         content=content,
@@ -120,6 +142,8 @@ def capture(
         metadata_extra=metadata_extra,
         embedding=embedding,
         after_insert=after_insert,
+        idempotency_key=idempotency_key,
+        response_extra=response_extra,
     )
 
 
@@ -135,34 +159,63 @@ def _bare_capture(
     metadata_extra=None,
     embedding=None,
     after_insert=None,
+    idempotency_key=None,
+    response_extra=None,
 ) -> dict:
+    # Phase 1: a lost-ACK replay returns the stored response and does no embed or
+    # metadata extraction. Best-effort — two concurrent first submits both miss and
+    # are resolved by Phase 2's on-conflict insert below.
+    if idempotency_key:
+        with brain_cursor() as cursor:
+            existing = lookup_idempotent(cursor, owner, idempotency_key)
+        if existing is not None:
+            return existing
+
     embedding_lit = to_vector_literal(
         embedding if embedding is not None else embed_query(content)
     )
     metadata = import_string(settings.BRAIN_METADATA_FN)(content)
     full_metadata = {**metadata, "source": client, **(metadata_extra or {})}
 
-    with transaction.atomic(), brain_cursor() as cursor:
-        experience_id = write_experience(
-            cursor,
-            content=content,
-            embedding_lit=embedding_lit,
-            metadata=full_metadata,
-            owner=owner,
-            source_kind=_DEFAULT_SOURCE_KIND,
-            account_id=account_id,
-            visibility=visibility,
-            lat=lat,
-            lng=lng,
-        )
-        if after_insert is not None:
-            after_insert(cursor, experience_id)
-
-    return {
-        "experience_id": experience_id,
-        "is_structured": False,
-        "metadata": full_metadata,
-    }
+    try:
+        with transaction.atomic(), brain_cursor() as cursor:
+            experience_id = write_experience(
+                cursor,
+                content=content,
+                embedding_lit=embedding_lit,
+                metadata=full_metadata,
+                owner=owner,
+                source_kind=_DEFAULT_SOURCE_KIND,
+                account_id=account_id,
+                visibility=visibility,
+                lat=lat,
+                lng=lng,
+            )
+            if after_insert is not None:
+                after_insert(cursor, experience_id)
+            result = {
+                "experience_id": experience_id,
+                "is_structured": False,
+                "metadata": full_metadata,
+                **(response_extra or {}),
+            }
+            # Phase 2: claim (owner, key) atomically with the experience. Zero rows
+            # means a concurrent racer won — roll this txn back and replay theirs.
+            if idempotency_key and not claim_idempotent(
+                cursor, owner, idempotency_key, result, experience_id
+            ):
+                raise _IdempotentReplay
+        return result
+    except _IdempotentReplay:
+        # Reached only when idempotency_key is set and a racer committed the key
+        # first, so the winner's row is guaranteed visible under READ COMMITTED.
+        with brain_cursor() as cursor:
+            replayed = lookup_idempotent(cursor, owner, idempotency_key)
+        if replayed is None:
+            raise RuntimeError(
+                f"idempotency replay found no winner for ({owner!r}, {idempotency_key!r})"
+            ) from None
+        return replayed
 
 
 def _structured_capture(
@@ -182,7 +235,17 @@ def _structured_capture(
     metadata_extra=None,
     embedding=None,
     after_insert=None,
+    idempotency_key=None,
+    response_extra=None,
 ) -> dict:
+    # Phase 1: a lost-ACK replay returns the stored response and does no embed or
+    # participant resolution (see _bare_capture for the two-phase rationale).
+    if idempotency_key:
+        with brain_cursor() as cursor:
+            existing = lookup_idempotent(cursor, owner, idempotency_key)
+        if existing is not None:
+            return existing
+
     parts = participants or []
     hints = predicate_hints or []
     people_names = [p["name"] for p in parts]
@@ -199,38 +262,56 @@ def _structured_capture(
     if metadata_extra:
         row_metadata.update(metadata_extra)
 
-    with transaction.atomic(), brain_cursor() as cursor:
-        experience_id = write_experience(
-            cursor,
-            content=content,
-            embedding_lit=embedding_lit,
-            metadata=row_metadata,
-            owner=owner,
-            occurred_at=occurred_at,
-            source_kind=source_kind
-            if source_kind is not None
-            else _DEFAULT_SOURCE_KIND,
-            source_ref=source_ref,
-            account_id=account_id,
-            visibility=visibility,
-            lat=lat,
-            lng=lng,
-        )
-        extracted, borderline, needs_disambiguation = _resolve_participants(
-            cursor, experience_id, embedding_lit, parts
-        )
-        if after_insert is not None:
-            after_insert(cursor, experience_id)
-
-    return {
-        "experience_id": experience_id,
-        "is_structured": True,
-        "metadata": _echo_metadata(predicate_hints, source_kind, source_ref),
-        "extracted_entities": extracted,
-        "borderline_matches": borderline,
-        "needs_disambiguation": needs_disambiguation,
-        "claims_pending": True,
-    }
+    try:
+        with transaction.atomic(), brain_cursor() as cursor:
+            experience_id = write_experience(
+                cursor,
+                content=content,
+                embedding_lit=embedding_lit,
+                metadata=row_metadata,
+                owner=owner,
+                occurred_at=occurred_at,
+                source_kind=source_kind
+                if source_kind is not None
+                else _DEFAULT_SOURCE_KIND,
+                source_ref=source_ref,
+                account_id=account_id,
+                visibility=visibility,
+                lat=lat,
+                lng=lng,
+            )
+            extracted, borderline, needs_disambiguation = _resolve_participants(
+                cursor, experience_id, embedding_lit, parts
+            )
+            if after_insert is not None:
+                after_insert(cursor, experience_id)
+            result = {
+                "experience_id": experience_id,
+                "is_structured": True,
+                "metadata": _echo_metadata(predicate_hints, source_kind, source_ref),
+                "extracted_entities": extracted,
+                "borderline_matches": borderline,
+                "needs_disambiguation": needs_disambiguation,
+                "claims_pending": True,
+                **(response_extra or {}),
+            }
+            # Phase 2: claim (owner, key) atomically with the experience; a zero-row
+            # conflict means a concurrent racer won — roll back and replay theirs.
+            if idempotency_key and not claim_idempotent(
+                cursor, owner, idempotency_key, result, experience_id
+            ):
+                raise _IdempotentReplay
+        return result
+    except _IdempotentReplay:
+        # Reached only when idempotency_key is set and a racer committed the key
+        # first, so the winner's row is guaranteed visible under READ COMMITTED.
+        with brain_cursor() as cursor:
+            replayed = lookup_idempotent(cursor, owner, idempotency_key)
+        if replayed is None:
+            raise RuntimeError(
+                f"idempotency replay found no winner for ({owner!r}, {idempotency_key!r})"
+            ) from None
+        return replayed
 
 
 def _resolve_participants(cursor, experience_id, embedding_lit, parts):
