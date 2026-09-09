@@ -95,7 +95,7 @@ Prerequisites: Docker, an [OpenRouter](https://openrouter.ai) API key (for
 embeddings + extraction).
 
 ```sh
-git clone https://github.com/JoeCotellese/mindgrapes-server
+git clone https://github.com/MindgrapesApp/mindgrapes-server
 cd mindgrapes-server
 cp .env.example .env
 # Fill in: POSTGRES_PASSWORD, OPENROUTER_API_KEY,
@@ -137,16 +137,16 @@ don't-use-when, on-empty, cost/idempotency) — the catalog lives in
 
 Mind Grapes is a server — capture surfaces live in their own repos:
 
-- [mindgrapes-extension](https://github.com/JoeCotellese/mindgrapes-extension) —
+- [mindgrapes-extension](https://github.com/MindgrapesApp/mindgrapes-extension) —
   Chrome MV3 extension that bookmarks pages into Mind Grapes, summarizing the
   current page and storing it as an experience
-- [mindgrapes-ios](https://github.com/JoeCotellese/mindgrapes-ios) — iOS,
+- [mindgrapes-ios](https://github.com/MindgrapesApp/mindgrapes-ios) — iOS,
   watchOS, and Siri capture surface
 
 ## Roadmap & issues
 
 Features, bugs, and the roadmap live in
-[GitHub Issues](https://github.com/JoeCotellese/mindgrapes-server/issues).
+[GitHub Issues](https://github.com/MindgrapesApp/mindgrapes-server/issues).
 Open a discussion issue before building a feature — the architecture has
 opinions (see the design record above), and the issue is where they get
 weighed.
