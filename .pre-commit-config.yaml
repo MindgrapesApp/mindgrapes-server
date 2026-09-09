@@ -5,11 +5,20 @@
 # Scans only staged files. Result levels: verified (live) + unverified (detected,
 # e.g. a private key); "unknown" is excluded so the deliberate dev `devpassword`
 # in the compose files doesn't trip every commit.
+#
+# The `lob` detector is excluded because its key pattern is `test_` followed by
+# exactly 35 characters of [a-z0-9_], which is also the shape of a great many
+# pytest function names — `test_options_preflight_answers_with_cors` and
+# `test_same_photo_twice_dedups_to_one_blob` both match, and the detector reports
+# them as VERIFIED. Since the scan reads whole staged files rather than the diff,
+# any commit touching such a file was blocked by names it did not introduce.
+# Nothing here talks to Lob (a direct-mail API), so the detector has no true
+# positives to find; if that ever changes, drop the exclusion and filter by path.
 repos:
   - repo: local
     hooks:
       - id: trufflehog
         name: trufflehog secret scan
-        entry: bash -c 'trufflehog filesystem "$@" --no-update --fail --results=verified,unverified' --
+        entry: bash -c 'trufflehog filesystem "$@" --no-update --fail --results=verified,unverified --exclude-detectors=lob' --
         language: system
         pass_filenames: true
